@@ -1,4 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
+from copy import deepcopy
+
 from easydict import EasyDict
 
 from .shared_config import va_shared_cfg
@@ -6,7 +8,7 @@ from .shared_config import va_shared_cfg
 va_robotwin_cfg = EasyDict(__name__='Config: VA robotwin')
 va_robotwin_cfg.update(va_shared_cfg)
 
-va_robotwin_cfg.wan22_pretrained_model_name_or_path = "/path/to/pretrained/model"
+va_robotwin_cfg.wan22_pretrained_model_name_or_path = "./checkpoints/lingbot-va-posttrain-robotwin"
 
 va_robotwin_cfg.attn_window = 72
 va_robotwin_cfg.frame_chunk_size = 2
@@ -52,3 +54,15 @@ va_robotwin_cfg.norm_stat = {
         1, 1
     ] + [0.] * 14 + [1.0, 1.0],
 }
+
+# ---------- A2A / F2F variant ----------
+va_robotwin_a2a_cfg = deepcopy(va_robotwin_cfg)
+va_robotwin_a2a_cfg.__name__ = 'Config: VA robotwin A2A'
+va_robotwin_a2a_cfg.use_a2a = True
+va_robotwin_a2a_cfg.use_f2f = True
+va_robotwin_a2a_cfg.a2a_denoising_strength = 0.5
+va_robotwin_a2a_cfg.f2f_denoising_strength = 0.5
+va_robotwin_a2a_cfg.a2a_noise_std = 0.1
+va_robotwin_a2a_cfg.f2f_noise_std = 0.0
+va_robotwin_a2a_cfg.a2a_num_inference_steps = 25
+va_robotwin_a2a_cfg.f2f_num_inference_steps = 15

@@ -1,0 +1,9 @@
+checkpoints/
+.cursor/
+paper/
+visualization/
+LingBot_VA.egg-info/
+**_pycache__/
+.claude/
+data/
+papers/

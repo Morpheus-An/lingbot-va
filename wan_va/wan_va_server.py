@@ -38,6 +38,18 @@ from utils import (
 )
 
 
+def _vram_mb():
+    return torch.cuda.memory_allocated() / 1024**2
+
+def _param_count(model):
+    return sum(p.numel() for p in model.parameters()) / 1e6
+
+def _tensor_stats(t, name="tensor"):
+    return (f"{name}: shape={list(t.shape)}, dtype={t.dtype}, "
+            f"min={t.min().item():.4f}, max={t.max().item():.4f}, "
+            f"mean={t.float().mean().item():.4f}, std={t.float().std().item():.4f}")
+
+
 class VA_Server:
 
     def __init__(self, job_config):
@@ -46,6 +58,11 @@ class VA_Server:
         self.save_root = job_config.save_root
         self.dtype = job_config.param_dtype
         self.device = torch.device(f"cuda:{job_config.local_rank}")
+
+        logger.info(f"[INIT] device={self.device}, dtype={self.dtype}")
+        logger.info(f"[INIT] model_path={job_config.wan22_pretrained_model_name_or_path}")
+        logger.info(f"[INIT] VRAM before loading: {_vram_mb():.1f} MB")
+        t_start_init = time.time()
 
         self.scheduler = FlowMatchScheduler(shift=self.job_config.snr_shift,
                                             sigma_min=0.0,
@@ -57,6 +74,7 @@ class VA_Server:
         self.scheduler.set_timesteps(1000, training=True)
         self.action_scheduler.set_timesteps(1000, training=True)
 
+        t0 = time.time()
         self.vae = load_vae(
             os.path.join(job_config.wan22_pretrained_model_name_or_path,
                          'vae'),
@@ -64,33 +82,46 @@ class VA_Server:
             torch_device=self.device,
         )
         self.streaming_vae = WanVAEStreamingWrapper(self.vae)
+        logger.info(f"[INIT] VAE loaded: {_param_count(self.vae):.1f}M params, "
+                     f"VRAM={_vram_mb():.1f} MB, time={time.time()-t0:.1f}s")
 
+        t0 = time.time()
         self.tokenizer = load_tokenizer(
             os.path.join(job_config.wan22_pretrained_model_name_or_path,
                          'tokenizer'), )
+        logger.info(f"[INIT] Tokenizer loaded: vocab_size={self.tokenizer.vocab_size}, time={time.time()-t0:.1f}s")
 
+        t0 = time.time()
         self.text_encoder = load_text_encoder(
             os.path.join(job_config.wan22_pretrained_model_name_or_path,
                          'text_encoder'),
             torch_dtype=self.dtype,
             torch_device=self.device,
         )
+        logger.info(f"[INIT] T5 encoder loaded: {_param_count(self.text_encoder):.1f}M params, "
+                     f"VRAM={_vram_mb():.1f} MB, time={time.time()-t0:.1f}s")
 
+        t0 = time.time()
         self.transformer = load_transformer(
             os.path.join(job_config.wan22_pretrained_model_name_or_path,
                          'transformer'),
             torch_dtype=self.dtype,
             torch_device=self.device,
         )
+        logger.info(f"[INIT] Transformer loaded (pre-FSDP): {_param_count(self.transformer):.1f}M params, "
+                     f"VRAM={_vram_mb():.1f} MB, time={time.time()-t0:.1f}s")
+
         shard_fn = partial(shard_model, device_id=job_config.local_rank)
         self.transformer = _configure_model(model=self.transformer,
                                             shard_fn=shard_fn,
                                             param_dtype=self.dtype,
                                             device=self.device)
+        logger.info(f"[INIT] Transformer after FSDP: VRAM={_vram_mb():.1f} MB")
 
         self.env_type = job_config.env_type
         self.streaming_vae_half = None
         if self.env_type == 'robotwin_tshape':
+            t0 = time.time()
             vae_half = load_vae(
                 os.path.join(job_config.wan22_pretrained_model_name_or_path,
                              'vae'),
@@ -98,6 +129,24 @@ class VA_Server:
                 torch_device=self.device,
             )
             self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
+            logger.info(f"[INIT] VAE_half (wrist cameras) loaded: VRAM={_vram_mb():.1f} MB, time={time.time()-t0:.1f}s")
+
+        # A2A / F2F modules
+        self.action_encoder = None
+        self.action_decoder = None
+        if getattr(job_config, 'use_a2a', False):
+            from modules.a2a_modules import ActionEncoder, ActionDecoder
+            self.action_encoder = ActionEncoder(
+                action_dim=job_config.action_dim,
+            ).to(self.device, self.dtype)
+            self.action_decoder = ActionDecoder(
+                action_dim=job_config.action_dim,
+            ).to(self.device, self.dtype)
+            logger.info(f"[INIT] A2A ActionEncoder ({_param_count(self.action_encoder):.3f}M) "
+                         f"+ ActionDecoder ({_param_count(self.action_decoder):.3f}M) loaded")
+
+        logger.info(f"[INIT] All components loaded. Total VRAM={_vram_mb():.1f} MB, "
+                     f"total time={time.time()-t_start_init:.1f}s")
 
     def _get_t5_prompt_embeds(
         self,
@@ -318,11 +367,13 @@ class VA_Server:
         return input_dict
 
     def _encode_obs(self, obs):
+        t_enc_start = time.time()
         images = obs['obs']
         if not isinstance(images, list):
             images = [images]
         if len(images) < 1:
             return None
+        logger.info(f"[ENCODE_OBS] num_frames={len(images)}, cam_keys={self.job_config.obs_cam_keys}")
         videos = []
         for k_i, k in enumerate(self.job_config.obs_cam_keys):
             if self.env_type == 'robotwin_tshape':
@@ -333,6 +384,8 @@ class VA_Server:
             else:
                 height_i, width_i = self.height, self.width
 
+            raw_img = images[0][k]
+            logger.info(f"[ENCODE_OBS] cam={k}: raw_shape={raw_img.shape}, target=({height_i}, {width_i})")
             history_video_k = torch.from_numpy(
                 np.stack([each[k]
                           for each in images])).float().permute(3, 0, 1, 2)
@@ -340,16 +393,20 @@ class VA_Server:
                                             size=(height_i, width_i),
                                             mode='bilinear',
                                             align_corners=False).unsqueeze(0)
+            logger.info(f"[ENCODE_OBS] cam={k}: resized tensor shape={list(history_video_k.shape)}")
             videos.append(history_video_k)
 
         if self.env_type == 'robotwin_tshape':
             videos_high = videos[0] / 255.0 * 2.0 - 1.0
             videos_left_and_right = torch.cat(videos[1:],
                                               dim=0) / 255.0 * 2.0 - 1.0
+            logger.info(f"[ENCODE_OBS] robotwin_tshape: videos_high={list(videos_high.shape)}, "
+                         f"videos_lr={list(videos_left_and_right.shape)}")
             enc_out_high = self.streaming_vae.encode_chunk(
                 videos_high.to(self.device).to(self.dtype))
             enc_out_left_and_right = self.streaming_vae_half.encode_chunk(
                 videos_left_and_right.to(self.device).to(self.dtype))
+            logger.info(f"[ENCODE_OBS] VAE out: high={list(enc_out_high.shape)}, lr={list(enc_out_left_and_right.shape)}")
             enc_out = torch.cat([
                 torch.cat(enc_out_left_and_right.split(1, dim=0), dim=-1),
                 enc_out_high
@@ -360,19 +417,31 @@ class VA_Server:
             videos_chunk = videos.to(self.device).to(self.dtype)
             enc_out = self.streaming_vae.encode_chunk(videos_chunk)
 
+        logger.info(f"[ENCODE_OBS] enc_out (concat): {list(enc_out.shape)}")
         mu, logvar = torch.chunk(enc_out, 2, dim=1)
         latents_mean = torch.tensor(self.vae.config.latents_mean).to(mu.device)
         latents_std = torch.tensor(self.vae.config.latents_std).to(mu.device)
         mu_norm = self.normalize_latents(mu, latents_mean, 1.0 / latents_std)
         video_latent = torch.cat(mu_norm.split(1, dim=0), dim=-1)
+        logger.info(f"[ENCODE_OBS] {_tensor_stats(video_latent, 'video_latent')}, "
+                     f"time={time.time()-t_enc_start:.2f}s")
         return video_latent
 
     def _reset(self, prompt=None):
-        logger.info('Reset.')
+        t_reset_start = time.time()
+        logger.info('=' * 60)
+        logger.info('[RESET] Starting reset...')
         self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
+        logger.info(f"[RESET] CFG enabled={self.use_cfg} "
+                     f"(video_scale={self.job_config.guidance_scale}, action_scale={self.job_config.action_guidance_scale})")
         #### Reset all parameters
         self.frame_st_id = 0
         self.init_latent = None
+        # A2A / F2F history buffers
+        from collections import deque
+        self.state_buffer = deque(maxlen=self.job_config.frame_chunk_size)
+        self.latent_buffer = deque(maxlen=self.job_config.frame_chunk_size)
+        self._last_raw_actions = None
         #### clean vae and transformer cache
         self.transformer.clear_cache(self.cache_name)
         self.streaming_vae.clear_cache()
@@ -394,6 +463,11 @@ class VA_Server:
                                       patch_size[0] * patch_size[1] *
                                       patch_size[2])
         action_token_per_chunk = self.job_config.frame_chunk_size * self.action_per_frame
+        logger.info(f"[RESET] latent_size=({self.latent_height}, {self.latent_width}), "
+                     f"latent_tokens/chunk={latent_token_per_chunk}, action_tokens/chunk={action_token_per_chunk}")
+        logger.info(f"[RESET] attn_window={self.job_config.attn_window}, "
+                     f"frame_chunk_size={self.job_config.frame_chunk_size}, "
+                     f"action_per_frame={self.action_per_frame}, action_dim={self.job_config.action_dim}")
         self.transformer.create_empty_cache(self.cache_name,
                                             self.job_config.attn_window,
                                             latent_token_per_chunk,
@@ -402,9 +476,12 @@ class VA_Server:
                                             device=self.device,
                                             batch_size = 2 if self.use_cfg else 1
                                             )
+        logger.info(f"[RESET] KV Cache created. VRAM={_vram_mb():.1f} MB")
 
         self.action_mask = torch.zeros([self.job_config.action_dim]).bool()
         self.action_mask[self.job_config.used_action_channel_ids] = True
+        logger.info(f"[RESET] action_mask: {self.action_mask.sum().item()}/{self.job_config.action_dim} channels active, "
+                     f"ids={self.job_config.used_action_channel_ids}")
 
         self.actions_q01 = torch.tensor(self.job_config.norm_stat['q01'],
                                         dtype=torch.float32).reshape(-1, 1, 1)
@@ -416,6 +493,8 @@ class VA_Server:
         if prompt is None:
             self.prompt_embeds = self.negative_prompt_embeds = None
         else:
+            logger.info(f"[RESET] Encoding prompt: '{prompt[:80]}...'")
+            t0 = time.time()
             self.prompt_embeds, self.negative_prompt_embeds = self.encode_prompt(
                 prompt=prompt,
                 negative_prompt=None,
@@ -427,41 +506,120 @@ class VA_Server:
                 device=self.device,
                 dtype=self.dtype,
             )
+            logger.info(f"[RESET] prompt_embeds={list(self.prompt_embeds.shape)}, "
+                         f"neg_embeds={'None' if self.negative_prompt_embeds is None else list(self.negative_prompt_embeds.shape)}, "
+                         f"time={time.time()-t0:.2f}s")
 
         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
         self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
         os.makedirs(self.exp_save_root, exist_ok=True)
         torch.cuda.empty_cache()
+        logger.info(f"[RESET] Complete. VRAM={_vram_mb():.1f} MB, time={time.time()-t_reset_start:.2f}s")
+        logger.info('=' * 60)
+
+    def _build_a2a_source(self, frame_chunk_size: int) -> torch.Tensor:
+        """Build A2A flow source from state_buffer with padding (repeat earliest frame)."""
+        buf = list(self.state_buffer)
+        frames = []
+        for item in buf:
+            for f in range(item.shape[2]):
+                frames.append(item[:, :, f:f + 1, :, :])
+        while len(frames) < frame_chunk_size:
+            frames.insert(0, frames[0].clone())
+        frames = frames[-frame_chunk_size:]
+        return torch.cat(frames, dim=2).to(self.device, self.dtype)
+
+    def _build_f2f_source(self, frame_chunk_size: int) -> torch.Tensor:
+        """Build F2F flow source from latent_buffer with padding (repeat earliest frame)."""
+        buf = list(self.latent_buffer)
+        while len(buf) < frame_chunk_size:
+            buf.insert(0, buf[0].clone())
+        buf = buf[-frame_chunk_size:]
+        return torch.cat(buf, dim=2).to(self.device, self.dtype)
 
     def _infer(self, obs, frame_st_id=0):
+        t_infer_start = time.time()
         frame_chunk_size = self.job_config.frame_chunk_size
+        logger.info(f"[INFER] frame_st_id={frame_st_id}, frame_chunk_size={frame_chunk_size}")
+
         if frame_st_id == 0:
             init_latent = self._encode_obs(obs)
             self.init_latent = init_latent
+            # Seed F2F latent_buffer from initial observation (for i2va mode)
+            if getattr(self.job_config, 'use_f2f', False) and len(self.latent_buffer) == 0:
+                for f_idx in range(init_latent.shape[2]):
+                    self.latent_buffer.append(init_latent[:, :, f_idx:f_idx + 1].detach().clone())
 
-        latents = torch.randn(1,
-                              48,
-                              frame_chunk_size,
-                              self.latent_height,
-                              self.latent_width,
-                              device=self.device,
-                              dtype=self.dtype)
-        actions = torch.randn(1,
-                              self.job_config.action_dim,
-                              frame_chunk_size,
-                              self.action_per_frame,
-                              1,
-                              device=self.device,
-                              dtype=self.dtype)
+        # === F2F Video Initialization ===
+        use_f2f = getattr(self.job_config, 'use_f2f', False) and len(self.latent_buffer) > 0
+        if use_f2f:
+            f2f_strength = self.job_config.f2f_denoising_strength
+            source_latents = self._build_f2f_source(frame_chunk_size)
+            if getattr(self.job_config, 'f2f_noise_std', 0) > 0:
+                source_latents = source_latents + self.job_config.f2f_noise_std * torch.randn_like(source_latents)
+            noise_v = torch.randn_like(source_latents)
+            latents = source_latents
+            logger.info(f"[INFER] F2F init from obs latent buffer (len={len(self.latent_buffer)}), "
+                         f"denoising_strength={f2f_strength}")
+        else:
+            f2f_strength = 1.0
+            noise_v = None
+            latents = torch.randn(1, 48, frame_chunk_size, self.latent_height,
+                                  self.latent_width, device=self.device, dtype=self.dtype)
+            logger.info(f"[INFER] Standard Gaussian noise init for video latents")
 
-        video_inference_step = self.job_config.num_inference_steps
-        action_inference_step = self.job_config.action_num_inference_steps
+        # === A2A Action Initialization ===
+        use_a2a = getattr(self.job_config, 'use_a2a', False) and len(self.state_buffer) > 0
+        if use_a2a:
+            a2a_strength = self.job_config.a2a_denoising_strength
+            source_actions = self._build_a2a_source(frame_chunk_size)
+            if self.action_encoder is not None:
+                source_actions = self.action_encoder(source_actions)
+            if getattr(self.job_config, 'a2a_noise_std', 0) > 0:
+                source_actions = source_actions + self.job_config.a2a_noise_std * torch.randn_like(source_actions)
+            noise_a = torch.randn_like(source_actions)
+            actions = source_actions
+            logger.info(f"[INFER] A2A init from state buffer (len={len(self.state_buffer)}), "
+                         f"denoising_strength={a2a_strength}")
+        else:
+            a2a_strength = 1.0
+            noise_a = None
+            actions = torch.randn(1, self.job_config.action_dim, frame_chunk_size,
+                                  self.action_per_frame, 1, device=self.device, dtype=self.dtype)
+            logger.info(f"[INFER] Standard Gaussian noise init for actions")
+
+        logger.info(f"[INFER] latents={list(latents.shape)}, actions={list(actions.shape)}")
+
+        # === Timestep setup (denoising_strength controls sigma range) ===
+        video_inference_step = (
+            getattr(self.job_config, 'f2f_num_inference_steps', None)
+            or self.job_config.num_inference_steps
+        ) if use_f2f else self.job_config.num_inference_steps
+        action_inference_step = (
+            getattr(self.job_config, 'a2a_num_inference_steps', None)
+            or self.job_config.action_num_inference_steps
+        ) if use_a2a else self.job_config.action_num_inference_steps
         video_step = self.job_config.video_exec_step
 
-        self.scheduler.set_timesteps(video_inference_step)
-        self.action_scheduler.set_timesteps(action_inference_step)
+        self.scheduler.set_timesteps(video_inference_step, denoising_strength=f2f_strength)
+        self.action_scheduler.set_timesteps(action_inference_step, denoising_strength=a2a_strength)
         timesteps = self.scheduler.timesteps
         action_timesteps = self.action_scheduler.timesteps
+
+        # F2F / A2A mixing: (1-sigma_0)*source + sigma_0*noise
+        if use_f2f:
+            sigma_0 = self.scheduler.sigmas[0]
+            latents = (1 - sigma_0) * latents + sigma_0 * noise_v
+            logger.info(f"[INFER] F2F mixed with sigma_0={sigma_0:.4f}")
+        if use_a2a:
+            sigma_0 = self.action_scheduler.sigmas[0]
+            actions = (1 - sigma_0) * actions + sigma_0 * noise_a
+            logger.info(f"[INFER] A2A mixed with sigma_0={sigma_0:.4f}")
+
+        logger.info(f"[INFER] video_steps={video_inference_step} (exec_step={video_step}), "
+                     f"action_steps={action_inference_step}")
+        logger.info(f"[INFER] video timesteps range: [{timesteps[0].item():.4f} -> {timesteps[-1].item():.4f}]")
+        logger.info(f"[INFER] action timesteps range: [{action_timesteps[0].item():.4f} -> {action_timesteps[-1].item():.4f}]")
 
         timesteps = F.pad(timesteps, (0, 1), mode='constant', value=0)
 
@@ -480,6 +638,8 @@ class VA_Server:
                 torch.no_grad(),
         ):
             # 1. Video Generation Loop
+            logger.info(f"[INFER] --- Video diffusion loop ({len(timesteps)} steps) ---")
+            t_video_start = time.time()
             for i, t in enumerate(tqdm(timesteps)):
                 last_step = i == len(timesteps) - 1
                 latent_cond = init_latent[:, :, 0:1].to(
@@ -515,6 +675,17 @@ class VA_Server:
 
                 latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
 
+                if i == 0 or i == len(timesteps) - 2 or last_step:
+                    logger.info(f"[INFER] video step {i}/{len(timesteps)-1}: t={t.item():.4f}, "
+                                 f"latent mean={latents.float().mean().item():.4f}, std={latents.float().std().item():.4f}, "
+                                 f"update_cache={'YES' if last_step else 'no'}")
+
+            t_video_end = time.time()
+            logger.info(f"[INFER] Video loop done: {t_video_end - t_video_start:.2f}s, "
+                         f"{_tensor_stats(latents, 'final_latents')}")
+
+            logger.info(f"[INFER] --- Action diffusion loop ({len(action_timesteps)} steps) ---")
+            t_action_start = time.time()
             for i, t in enumerate(tqdm(action_timesteps)):
                 last_step = i == len(action_timesteps) - 1
                 action_cond = torch.zeros(
@@ -554,13 +725,33 @@ class VA_Server:
 
                 actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
 
+                if i == 0 or i == len(action_timesteps) - 2 or last_step:
+                    logger.info(f"[INFER] action step {i}/{len(action_timesteps)-1}: t={t.item():.4f}, "
+                                 f"action mean={actions.float().mean().item():.4f}, std={actions.float().std().item():.4f}, "
+                                 f"update_cache={'YES' if last_step else 'no'}")
+
+            t_action_end = time.time()
+            logger.info(f"[INFER] Action loop done: {t_action_end - t_action_start:.2f}s, "
+                         f"{_tensor_stats(actions, 'raw_actions')}")
+
+        # Save pre-decode actions for i2va A2A buffer population
+        self._last_raw_actions = actions.detach().clone()
+
+        # A2A: decode flow output back to real action space
+        if use_a2a and self.action_decoder is not None:
+            actions = self.action_decoder(actions)
+            logger.info(f"[INFER] A2A ActionDecoder applied")
+
         actions[:, ~self.action_mask] *= 0
 
         save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
         save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
 
         actions = self.postprocess_action(actions)
+        logger.info(f"[INFER] postprocessed actions: shape={actions.shape}, "
+                     f"min={actions.min():.4f}, max={actions.max():.4f}")
         torch.cuda.empty_cache()
+        logger.info(f"[INFER] Chunk complete. Total time={time.time()-t_infer_start:.2f}s, VRAM={_vram_mb():.1f} MB")
         return actions, latents
 
     def _compute_kv_cache(self, obs):
@@ -578,6 +769,15 @@ class VA_Server:
         logger.info(
             f"get KV cache obs: {latent_model_input.shape} {action_model_input.shape}"
         )
+
+        # A2A / F2F: collect real observations into history buffers
+        if getattr(self.job_config, 'use_a2a', False):
+            self.state_buffer.append(action_model_input.detach().clone())
+        if getattr(self.job_config, 'use_f2f', False) and latent_model_input is not None:
+            for f_idx in range(latent_model_input.shape[2]):
+                self.latent_buffer.append(
+                    latent_model_input[:, :, f_idx:f_idx + 1].detach().clone()
+                )
         input_dict = self._prepare_latent_input(latent_model_input,
                                                 action_model_input,
                                                 frame_st_id=self.frame_st_id)
@@ -641,18 +841,43 @@ class VA_Server:
     
     @torch.no_grad()
     def generate(self):
+        t_gen_start = time.time()
+        logger.info('#' * 60)
+        logger.info(f"[GENERATE] Starting i2va generation")
+        logger.info(f"[GENERATE] prompt='{self.job_config.prompt}'")
+        logger.info(f"[GENERATE] num_chunks={self.job_config.num_chunks_to_infer}, "
+                     f"input_img_path='{self.job_config.input_img_path}'")
+
         self.video_processor = VideoProcessor(vae_scale_factor=1)
         self._reset(self.job_config.prompt)
         init_obs = self.load_init_obs()
+        logger.info(f"[GENERATE] Loaded init obs: {len(init_obs['obs'])} frames, "
+                     f"cam_keys={list(init_obs['obs'][0].keys())}")
+        for k, v in init_obs['obs'][0].items():
+            logger.info(f"[GENERATE]   {k}: shape={v.shape}, dtype={v.dtype}")
+
         pred_latent_lst = []
         pred_action_lst = []
         for chunk_id in range(self.job_config.num_chunks_to_infer):
+            logger.info(f"[GENERATE] ====== Chunk {chunk_id}/{self.job_config.num_chunks_to_infer-1} ======")
+            t_chunk = time.time()
             actions, latents = self._infer(init_obs, frame_st_id=(chunk_id * self.job_config.frame_chunk_size))
+            # i2va fallback: populate A2A/F2F buffers from generated outputs
+            if getattr(self.job_config, 'use_f2f', False):
+                for f_idx in range(latents.shape[2]):
+                    self.latent_buffer.append(latents[:, :, f_idx:f_idx + 1].detach().clone())
+            if getattr(self.job_config, 'use_a2a', False) and self._last_raw_actions is not None:
+                self.state_buffer.append(self._last_raw_actions)
             actions = torch.from_numpy(actions)
             pred_latent_lst.append(latents)
             pred_action_lst.append(actions)
+            logger.info(f"[GENERATE] Chunk {chunk_id} done in {time.time()-t_chunk:.2f}s")
+
         pred_latent = torch.cat(pred_latent_lst, dim=2)
         pred_action = torch.cat(pred_action_lst, dim=1).flatten(1)
+        logger.info(f"[GENERATE] All chunks done. pred_latent={list(pred_latent.shape)}, pred_action={list(pred_action.shape)}")
+        logger.info(f"[GENERATE] Total inference time={time.time()-t_gen_start:.2f}s")
+
         self.transformer.clear_cache(self.cache_name)
         self.streaming_vae.clear_cache()
         if self.streaming_vae_half:
@@ -661,8 +886,19 @@ class VA_Server:
         del self.streaming_vae_half
         del self.text_encoder
         torch.cuda.empty_cache()
+        logger.info(f"[GENERATE] After cleanup: VRAM={_vram_mb():.1f} MB")
+
+        logger.info(f"[GENERATE] Decoding video from latents {list(pred_latent.shape)}...")
+        t_decode = time.time()
         decoded_video = self.decode_one_video(pred_latent, 'np')[0]
-        export_to_video(decoded_video, os.path.join(self.save_root, "demo.mp4"), fps=10)
+        logger.info(f"[GENERATE] Video decoded: {len(decoded_video)} frames, "
+                     f"frame_shape={decoded_video[0].shape}, time={time.time()-t_decode:.2f}s")
+
+        out_path = os.path.join(self.save_root, "demo.mp4")
+        export_to_video(decoded_video, out_path, fps=10)
+        logger.info(f"[GENERATE] Video saved to {out_path}")
+        logger.info(f"[GENERATE] TOTAL TIME: {time.time()-t_gen_start:.2f}s")
+        logger.info('#' * 60)
 
 def run(args):    
     
@@ -717,5 +953,8 @@ def main():
 
 
 if __name__ == "__main__":
+    init_logger()
+    main()
+ == "__main__":
     init_logger()
     main()

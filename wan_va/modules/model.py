@@ -132,13 +132,13 @@ class WanAttention(torch.nn.Module):
         attn_mode='torch',
     ):
         super().__init__()
-        if attn_mode == 'torch':
+        if attn_mode in ('torch', 'flex'):
             self.attn_op = custom_sdpa
         elif attn_mode == 'flashattn':
             self.attn_op = flash_attn_func
         else:
             raise ValueError(
-                f"Unsupported attention mode: {attn_mode}, only support torch and flashattn"
+                f"Unsupported attention mode: {attn_mode}, only support torch, flex and flashattn"
             )
 
         self.inner_dim = dim_head * heads
@@ -251,8 +251,8 @@ class WanAttention(torch.nn.Module):
         update_cache=0,
         cache_name='pos',
     ):
-        kv_cache = self.attn_caches[
-            cache_name] if self.attn_caches is not None else None
+        kv_cache = self.attn_caches.get(
+            cache_name) if self.attn_caches is not None else None
 
         query, key, value = self.to_q(q), self.to_k(k), self.to_v(v)
         query = self.norm_q(query)

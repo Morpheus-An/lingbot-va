@@ -108,6 +108,24 @@ class FlowMatchScheduler():
         sample = (1 - sigma) * original_samples + sigma * noise
         return sample
 
+    def add_noise_from_source(self, original_samples, source, timestep, t_dim=2):
+        """A2A/F2F: interpolate between clean target and source (replaces Gaussian noise)."""
+        if isinstance(timestep, torch.Tensor):
+            timestep = timestep.cpu()
+        timestep = timestep[None]
+        timestep_id = torch.argmin(
+            (self.timesteps[:, None] - timestep).abs(), dim=0
+        )
+        shape = [1] * source.ndim
+        shape[t_dim] = timestep_id.shape[0]
+        sigma = self.sigmas[timestep_id].to(original_samples).view(shape)
+        sample = (1 - sigma) * original_samples + sigma * source
+        return sample
+
+    def training_target_from_source(self, sample, source, timestep):
+        """A2A/F2F training target: velocity = source - clean_sample."""
+        return source - sample
+
     def training_target(self, sample, noise, timestep):
         target = noise - sample
         return target
